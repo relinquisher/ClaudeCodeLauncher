@@ -28,7 +28,8 @@ ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07')
 
 # 直近読み上げたテキストの履歴（TUI の再描画による重複読み上げを防ぐ）
 _spoken_history = []
-_HISTORY_MAX = 30
+_HISTORY_MAX = 50  # より多くの履歴を保持して重複を防ぐ
+_debug_log = []  # デバッグ用ログ
 
 # 拡張キー（矢印キーなど）→ ANSI エスケープシーケンス
 ARROW_MAP = {
@@ -51,6 +52,7 @@ def speak(text):
             "-Command",
             "Add-Type -AssemblyName System.Speech; "
             "$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            "$synth.Rate = -2; "  # 少し遅めに
             f"$synth.Speak('{safe_text}')"
         ]
         subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -62,13 +64,20 @@ def maybe_speak(clean_text, in_code_block):
     text = clean_text.strip()
     if not text or in_code_block:
         return
+    # 日本語を含まない行はスキップ
     if not JA_RE.search(text):
         return
+
+    # 同じテキストが最近読み上げられていないかチェック
+    # 履歴に含まれていれば読み上げ済みなのでスキップ
     if text in _spoken_history:
         return
+
+    # 新しいテキストなので履歴に追加して読み上げ
     _spoken_history.append(text)
     if len(_spoken_history) > _HISTORY_MAX:
         _spoken_history.pop(0)
+
     speak(text)
 
 
