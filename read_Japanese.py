@@ -176,6 +176,87 @@ def stdin_forwarder(pty):
             break
 
 
+def mouse_forwarder(pty):
+    """ReadConsoleInput でマウス・リサイズイベントを処理し、VT100シーケンスで転送"""
+    import ctypes
+    import struct
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)
+
+        # ReadConsoleInput の型情報を指定
+        kernel32.ReadConsoleInput.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)
+        ]
+        kernel32.ReadConsoleInput.restype = ctypes.c_bool
+
+        log("[MOUSE] マウスイベント処理スレッド開始")
+    except Exception as e:
+        log(f"[MOUSE] 初期化失敗: {e}")
+        return
+
+    while True:
+        try:
+            buffer = ctypes.create_string_buffer(20)
+            num_events = ctypes.c_ulong()
+
+            if not kernel32.ReadConsoleInput(handle, buffer, 1, ctypes.byref(num_events)):
+                log("[MOUSE] ReadConsoleInput 失敗")
+                break
+
+            if num_events.value == 0:
+                time.sleep(0.01)
+                continue
+
+            event_type = struct.unpack('<H', buffer[0:2])[0]
+
+            # イベントタイプ 2 = マウスイベント
+            if event_type == 2:
+                x = struct.unpack('<H', buffer[4:6])[0]
+                y = struct.unpack('<H', buffer[6:8])[0]
+                button_state = struct.unpack('<I', buffer[8:12])[0]
+                event_flags = struct.unpack('<I', buffer[16:20])[0]
+
+                # マウスホイール（MOUSE_WHEELED = 0x0008）
+                if event_flags & 0x0008:
+                    wheel_high = struct.unpack('<h', struct.pack('<H',
+                        (struct.unpack('<I', buffer[16:20])[0] >> 16) & 0xFFFF))[0]
+                    if wheel_high > 0:
+                        pty.write(f'\x1b[<65;{x};{y}M')
+                        log(f"[MOUSE] ホイール上")
+                    else:
+                        pty.write(f'\x1b[<66;{x};{y}M')
+                        log(f"[MOUSE] ホイール下")
+
+                # ボタンプレス・ドラッグ
+                elif button_state != 0:
+                    if button_state & 0x0001:  # 左ボタン
+                        pty.write(f'\x1b[<0;{x};{y}M')
+                    elif button_state & 0x0002:  # 右ボタン
+                        pty.write(f'\x1b[<2;{x};{y}M')
+                    elif button_state & 0x0004:  # 中央ボタン
+                        pty.write(f'\x1b[<1;{x};{y}M')
+
+                # ボタンリリース
+                elif event_flags & 0x0001:  # MOUSE_MOVED without buttons
+                    pty.write(f'\x1b[<3;{x};{y}M')
+
+            # イベントタイプ 4 = ウインドウサイズ変更
+            elif event_type == 4:
+                cols = struct.unpack('<H', buffer[4:6])[0]
+                rows = struct.unpack('<H', buffer[6:8])[0]
+                try:
+                    log(f"[RESIZE] {rows}x{cols}")
+                    pty.setwinsize(rows, cols)
+                except Exception as e:
+                    log(f"[RESIZE] エラー: {e}")
+
+        except Exception as e:
+            log(f"[MOUSE] ループエラー: {e}")
+            time.sleep(0.1)
+
+
 def window_size_monitor(pty, stop_event):
     """ウインドウサイズの変更を定期的に監視するスレッド"""
     try:
@@ -243,6 +324,10 @@ def main():
 
     t = threading.Thread(target=stdin_forwarder, args=(pty,), daemon=True)
     t.start()
+
+    # マウス・リサイズイベント処理スレッド
+    mouse_thread = threading.Thread(target=mouse_forwarder, args=(pty,), daemon=True)
+    mouse_thread.start()
 
     monitor_thread = threading.Thread(
         target=window_size_monitor, args=(pty, stop_event), daemon=True)
