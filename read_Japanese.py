@@ -110,6 +110,16 @@ def maybe_speak(clean_text, in_code_block):
     # 「●」を除去してクリーンアップ
     filtered = text[1:].strip()
 
+    # バックスラッシュなどの制御文字を明示的に除外
+    if '\\' in filtered or '\x1b' in filtered:
+        log(f"[SKIP] 制御文字含む: {filtered[:50]}")
+        return
+
+    # 制御文字（ord < 32）を除外
+    if any(ord(c) < 32 for c in filtered):
+        log(f"[SKIP] 制御コード含む: {filtered[:50]}")
+        return
+
     # 日本語を含まない行はスキップ
     if not JA_RE.search(filtered):
         return
@@ -122,6 +132,20 @@ def stdin_forwarder(pty):
     """標準入力のキー入力を読み取り、PTY へ転送するスレッド"""
     if msvcrt is None:
         return
+
+    # Windows コンソールの入力モードを設定してマウスサポートを有効化
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_ulong()
+        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+        # ENABLE_MOUSE_INPUT を追加
+        mode.value |= 0x0010  # ENABLE_MOUSE_INPUT
+        kernel32.SetConsoleMode(handle, mode)
+    except Exception:
+        pass
+
     while True:
         try:
             ch = msvcrt.getwch()
@@ -158,8 +182,8 @@ def main():
     log(f"実行コマンド: {argv}")
 
     try:
-        size = os.get_terminal_size()
-        cols, rows = size.columns, size.lines
+        import shutil
+        cols, rows = shutil.get_terminal_size((120, 30))
     except Exception:
         cols, rows = 120, 30
 
@@ -167,6 +191,12 @@ def main():
         log("PtyProcess.spawn() 実行中...")
         pty = PtyProcess.spawn(argv, dimensions=(rows, cols))
         log("PtyProcess 起動成功")
+
+        # PTY のバッファリング無効化
+        try:
+            pty.setwinsize(rows, cols)
+        except Exception:
+            pass
     except Exception as e:
         log(f"PtyProcess 起動失敗: {e}")
         sys.exit(1)
