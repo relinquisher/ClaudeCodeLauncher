@@ -139,38 +139,123 @@ def maybe_speak(clean_text, in_code_block):
 
 
 def stdin_forwarder(pty):
-    """標準入力のキー入力を読み取り、PTY へ転送するスレッド"""
+    """ReadConsoleInput を使ってキーボード、マウス、リサイズイベントを処理"""
+    import ctypes
+    import struct
+
     if msvcrt is None:
         return
 
     try:
-        import ctypes
         kernel32 = ctypes.windll.kernel32
         handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+
+        # コンソール入力モード：マウスと拡張キーを有効化
         mode = ctypes.c_ulong()
         kernel32.GetConsoleMode(handle, ctypes.byref(mode))
-        # マウス入力を有効化し、拡張キー入力も有効化
-        mode.value |= 0x0010  # ENABLE_MOUSE_INPUT を有効化
-        mode.value |= 0x0080  # ENABLE_EXTENDED_FLAGS を有効化
+        mode.value |= 0x0010  # ENABLE_MOUSE_INPUT
+        mode.value |= 0x0080  # ENABLE_EXTENDED_FLAGS
         kernel32.SetConsoleMode(handle, mode)
-        log("[INPUT] コンソール入力モード設定完了")
+        log("[INPUT] コンソール入力モード設定完了（マウスと拡張キー有効）")
     except Exception as e:
         log(f"[INPUT] コンソール設定エラー: {e}")
+        return
+
+    # INPUT_RECORD 構造体（20 bytes）
+    num_events = ctypes.c_ulong()
 
     while True:
         try:
-            ch = msvcrt.getwch()
-        except Exception:
-            break
-        try:
-            if ch in ('\x00', '\xe0'):
-                ch2 = msvcrt.getwch()
-                seq = ARROW_MAP.get(ch2)
-                if seq:
-                    pty.write(seq)
+            buffer = ctypes.create_string_buffer(20)
+            if not kernel32.ReadConsoleInput(handle, buffer, 1, ctypes.byref(num_events)):
+                break
+
+            if num_events.value == 0:
                 continue
-            pty.write(ch)
-        except Exception:
+
+            # イベント型（最初の 2 bytes）
+            event_type = struct.unpack('<H', buffer[0:2])[0]
+
+            if event_type == 1:  # KEY_EVENT_RECORD
+                key_down = struct.unpack('<I', buffer[4:8])[0]
+                vkey = struct.unpack('<H', buffer[8:10])[0]
+                vscan = struct.unpack('<H', buffer[10:12])[0]
+                char_code = struct.unpack('<H', buffer[12:14])[0]
+
+                if key_down:
+                    try:
+                        if vkey == 38:  # VK_UP
+                            pty.write('\x1b[A')
+                        elif vkey == 40:  # VK_DOWN
+                            pty.write('\x1b[B')
+                        elif vkey == 39:  # VK_RIGHT
+                            pty.write('\x1b[C')
+                        elif vkey == 37:  # VK_LEFT
+                            pty.write('\x1b[D')
+                        elif vkey == 46:  # VK_DELETE
+                            pty.write('\x1b[3~')
+                        elif vkey == 45:  # VK_INSERT
+                            pty.write('\x1b[2~')
+                        elif vkey == 36:  # VK_HOME
+                            pty.write('\x1b[H')
+                        elif vkey == 35:  # VK_END
+                            pty.write('\x1b[F')
+                        elif vkey == 33:  # VK_PRIOR (Page Up)
+                            pty.write('\x1b[5~')
+                        elif vkey == 34:  # VK_NEXT (Page Down)
+                            pty.write('\x1b[6~')
+                        elif char_code > 0:
+                            pty.write(chr(char_code))
+                    except Exception as e:
+                        log(f"[KEY] 処理エラー: {e}")
+
+            elif event_type == 2:  # MOUSE_EVENT_RECORD
+                x = struct.unpack('<H', buffer[4:6])[0]
+                y = struct.unpack('<H', buffer[6:8])[0]
+                button_state = struct.unpack('<I', buffer[8:12])[0]
+                control_state = struct.unpack('<I', buffer[12:16])[0]
+                event_flags = struct.unpack('<I', buffer[16:20])[0]
+
+                try:
+                    # マウスホイール（VT100 SGR マウスレポート）
+                    if event_flags & 0x0008:  # MOUSE_WHEELED
+                        wheel_delta = struct.unpack('>h', struct.pack('>H',
+                            struct.unpack('<I', buffer[16:20])[0] >> 16))[0]
+                        if wheel_delta > 0:
+                            pty.write(f'\x1b[<65;{x};{y}M')  # ホイール上
+                        else:
+                            pty.write(f'\x1b[<66;{x};{y}M')  # ホイール下
+                        log(f"[MOUSE] ホイール: delta={wheel_delta}, pos=({x},{y})")
+
+                    # マウスボタンプレス
+                    elif button_state & 0x0001:  # 左ボタン
+                        if event_flags & 0x0004:  # ダブルクリック
+                            pty.write(f'\x1b[<0;{x};{y}M')
+                        else:
+                            pty.write(f'\x1b[<0;{x};{y}M')
+                        log(f"[MOUSE] 左ボタン: pos=({x},{y})")
+
+                    elif button_state & 0x0002:  # 右ボタン
+                        pty.write(f'\x1b[<2;{x};{y}M')
+                        log(f"[MOUSE] 右ボタン: pos=({x},{y})")
+
+                    else:  # ボタンなし（移動のみ）
+                        pty.write(f'\x1b[<3;{x};{y}M')  # 移動
+
+                except Exception as e:
+                    log(f"[MOUSE] 処理エラー: {e}")
+
+            elif event_type == 4:  # WINDOW_BUFFER_SIZE_RECORD
+                cols = struct.unpack('<H', buffer[4:6])[0]
+                rows = struct.unpack('<H', buffer[6:8])[0]
+                try:
+                    log(f"[RESIZE] コンソール: {rows}x{cols}")
+                    pty.setwinsize(rows, cols)
+                except Exception as e:
+                    log(f"[RESIZE] エラー: {e}")
+
+        except Exception as e:
+            log(f"[INPUT] 読み込みエラー: {e}")
             break
 
 
