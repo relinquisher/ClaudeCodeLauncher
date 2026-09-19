@@ -138,150 +138,77 @@ def maybe_speak(clean_text, in_code_block):
     speak(filtered)
 
 
-def stdin_forwarder(pty):
-    """標準入力のキー入力を読み取り、PTY へ転送するスレッド"""
-    if msvcrt is None:
-        return
+_saved_modes = []
 
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
-        mode = ctypes.c_ulong()
-        kernel32.GetConsoleMode(handle, ctypes.byref(mode))
-        # マウス入力と拡張キーを有効化
-        mode.value |= 0x0010  # ENABLE_MOUSE_INPUT
-        mode.value |= 0x0080  # ENABLE_EXTENDED_FLAGS
-        kernel32.SetConsoleMode(handle, mode)
-        log("[INPUT] コンソール: マウスと拡張キーを有効化")
-    except Exception as e:
-        log(f"[INPUT] モード設定失敗: {e}")
 
-    while True:
+def _setup_console():
+    """入力を VT モード(生バイト中継)、出力を VT 処理有効にする。終了時に復元する。"""
+    import ctypes
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    k32.GetStdHandle.restype = ctypes.c_void_p
+    k32.GetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    k32.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    hin = k32.GetStdHandle(-10)
+    hout = k32.GetStdHandle(-11)
+
+    m = ctypes.c_ulong()
+    if k32.GetConsoleMode(hin, ctypes.byref(m)):
+        _saved_modes.append((k32, hin, m.value))
+        # LINE_INPUT/ECHO/PROCESSED を切り、VIRTUAL_TERMINAL_INPUT を入れる
+        new_in = (m.value & ~(0x0001 | 0x0002 | 0x0004)) | 0x0200
+        ok = k32.SetConsoleMode(hin, new_in)
+        log(f"[CONSOLE] stdin mode {m.value:#x} -> {new_in:#x} ok={bool(ok)}")
+    if k32.GetConsoleMode(hout, ctypes.byref(m)):
+        _saved_modes.append((k32, hout, m.value))
+        new_out = m.value | 0x0001 | 0x0004  # PROCESSED_OUTPUT | VT_PROCESSING
+        ok = k32.SetConsoleMode(hout, new_out)
+        log(f"[CONSOLE] stdout mode {m.value:#x} -> {new_out:#x} ok={bool(ok)}")
+    return k32, hin
+
+
+def _restore_console():
+    for k32, h, v in _saved_modes:
         try:
-            ch = msvcrt.getwch()
+            k32.SetConsoleMode(h, v)
         except Exception:
-            log("[INPUT] getwch() 終了")
+            pass
+
+
+def stdin_forwarder(pty, k32, hin):
+    """端末からの入力(キー・マウス・DA応答などのVTシーケンス)を生バイトのまま PTY へ中継"""
+    import ctypes
+    import codecs
+    k32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong,
+                             ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p]
+    dec = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    buf = ctypes.create_string_buffer(4096)
+    n = ctypes.c_ulong()
+    while True:
+        if not k32.ReadFile(hin, buf, 4096, ctypes.byref(n), None) or n.value == 0:
+            log(f"[INPUT] ReadFile 終了 err={ctypes.get_last_error()}")
             break
+        text = dec.decode(buf.raw[:n.value])
+        if not text:
+            continue
         try:
-            if ch in ('\x00', '\xe0'):
-                ch2 = msvcrt.getwch()
-                seq = ARROW_MAP.get(ch2)
-                if seq:
-                    pty.write(seq)
-                continue
-            pty.write(ch)
+            pty.write(text)
         except Exception as e:
             log(f"[INPUT] PTY書き込み失敗: {e}")
             break
 
 
-def mouse_forwarder(pty):
-    """ReadConsoleInput でマウス・リサイズイベントを処理し、VT100シーケンスで転送"""
-    import ctypes
-    import struct
-
-    try:
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(-10)
-
-        # ReadConsoleInput の型情報を指定
-        kernel32.ReadConsoleInput.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)
-        ]
-        kernel32.ReadConsoleInput.restype = ctypes.c_bool
-
-        log("[MOUSE] マウスイベント処理スレッド開始")
-    except Exception as e:
-        log(f"[MOUSE] 初期化失敗: {e}")
-        return
-
-    while True:
-        try:
-            buffer = ctypes.create_string_buffer(20)
-            num_events = ctypes.c_ulong()
-
-            if not kernel32.ReadConsoleInput(handle, buffer, 1, ctypes.byref(num_events)):
-                log("[MOUSE] ReadConsoleInput 失敗")
-                break
-
-            if num_events.value == 0:
-                time.sleep(0.01)
-                continue
-
-            event_type = struct.unpack('<H', buffer[0:2])[0]
-
-            # イベントタイプ 2 = マウスイベント
-            if event_type == 2:
-                x = struct.unpack('<H', buffer[4:6])[0]
-                y = struct.unpack('<H', buffer[6:8])[0]
-                button_state = struct.unpack('<I', buffer[8:12])[0]
-                event_flags = struct.unpack('<I', buffer[16:20])[0]
-
-                # マウスホイール（MOUSE_WHEELED = 0x0008）
-                if event_flags & 0x0008:
-                    wheel_high = struct.unpack('<h', struct.pack('<H',
-                        (struct.unpack('<I', buffer[16:20])[0] >> 16) & 0xFFFF))[0]
-                    if wheel_high > 0:
-                        pty.write(f'\x1b[<65;{x};{y}M')
-                        log(f"[MOUSE] ホイール上")
-                    else:
-                        pty.write(f'\x1b[<66;{x};{y}M')
-                        log(f"[MOUSE] ホイール下")
-
-                # ボタンプレス・ドラッグ
-                elif button_state != 0:
-                    if button_state & 0x0001:  # 左ボタン
-                        pty.write(f'\x1b[<0;{x};{y}M')
-                    elif button_state & 0x0002:  # 右ボタン
-                        pty.write(f'\x1b[<2;{x};{y}M')
-                    elif button_state & 0x0004:  # 中央ボタン
-                        pty.write(f'\x1b[<1;{x};{y}M')
-
-                # ボタンリリース
-                elif event_flags & 0x0001:  # MOUSE_MOVED without buttons
-                    pty.write(f'\x1b[<3;{x};{y}M')
-
-            # イベントタイプ 4 = ウインドウサイズ変更
-            elif event_type == 4:
-                cols = struct.unpack('<H', buffer[4:6])[0]
-                rows = struct.unpack('<H', buffer[6:8])[0]
-                try:
-                    log(f"[RESIZE] {rows}x{cols}")
-                    pty.setwinsize(rows, cols)
-                except Exception as e:
-                    log(f"[RESIZE] エラー: {e}")
-
-        except Exception as e:
-            log(f"[MOUSE] ループエラー: {e}")
-            time.sleep(0.1)
-
-
 def window_size_monitor(pty, stop_event):
-    """ウインドウサイズの変更を定期的に監視するスレッド"""
-    try:
-        last_rows, last_cols = shutil.get_terminal_size((120, 30))
-    except Exception:
-        last_rows, last_cols = 120, 30
-
-    while not stop_event.is_set():
+    """端末サイズの変更を監視して PTY に反映する"""
+    last = shutil.get_terminal_size((120, 30))
+    while not stop_event.wait(0.1):
         try:
-            time.sleep(0.2)  # 200ms ごとにチェック
-            try:
-                new_cols, new_rows = shutil.get_terminal_size((120, 30))
-            except Exception:
-                continue
-
-            if new_rows != last_rows or new_cols != last_cols:
-                try:
-                    log(f"[RESIZE] {last_rows}x{last_cols} -> {new_rows}x{new_cols}")
-                    pty.setwinsize(new_rows, new_cols)
-                    last_rows, last_cols = new_rows, new_cols
-                except Exception as e:
-                    log(f"[RESIZE] setwinsize エラー: {e}")
+            cur = shutil.get_terminal_size((120, 30))
+            if cur != last:
+                log(f"[RESIZE] {last.columns}x{last.lines} -> {cur.columns}x{cur.lines}")
+                pty.setwinsize(cur.lines, cur.columns)
+                last = cur
         except Exception as e:
-            log(f"[MONITOR] エラー: {e}")
-            break
+            log(f"[RESIZE] エラー: {e}")
 
 
 def main():
@@ -322,16 +249,12 @@ def main():
 
     stop_event = threading.Event()
 
-    t = threading.Thread(target=stdin_forwarder, args=(pty,), daemon=True)
-    t.start()
-
-    # マウス・リサイズイベント処理スレッド
-    mouse_thread = threading.Thread(target=mouse_forwarder, args=(pty,), daemon=True)
-    mouse_thread.start()
-
-    monitor_thread = threading.Thread(
-        target=window_size_monitor, args=(pty, stop_event), daemon=True)
-    monitor_thread.start()
+    try:
+        k32, hin = _setup_console()
+        threading.Thread(target=stdin_forwarder, args=(pty, k32, hin), daemon=True).start()
+    except Exception as e:
+        log(f"[CONSOLE] 設定失敗: {e}")
+    threading.Thread(target=window_size_monitor, args=(pty, stop_event), daemon=True).start()
 
     in_code_block = False
     line_buf = ""
@@ -400,6 +323,7 @@ def main():
         log("KeyboardInterrupt")
     finally:
         stop_event.set()
+        _restore_console()
         try:
             pty.close(force=True)
         except Exception:
