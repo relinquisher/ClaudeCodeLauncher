@@ -143,20 +143,19 @@ def stdin_forwarder(pty):
     if msvcrt is None:
         return
 
-    # Windows コンソールの入力モードを設定：矢印キー対応、マウス無効
     try:
         import ctypes
         kernel32 = ctypes.windll.kernel32
         handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
         mode = ctypes.c_ulong()
         kernel32.GetConsoleMode(handle, ctypes.byref(mode))
-        # マウスイベント処理を無効化（スクロール問題の原因）
-        mode.value &= ~0x0010  # ENABLE_MOUSE_INPUT を削除
-        # 拡張キー入力を有効化
-        mode.value |= 0x0080  # ENABLE_EXTENDED_FLAGS
+        # マウス入力を有効化し、拡張キー入力も有効化
+        mode.value |= 0x0010  # ENABLE_MOUSE_INPUT を有効化
+        mode.value |= 0x0080  # ENABLE_EXTENDED_FLAGS を有効化
         kernel32.SetConsoleMode(handle, mode)
-    except Exception:
-        pass
+        log("[INPUT] コンソール入力モード設定完了")
+    except Exception as e:
+        log(f"[INPUT] コンソール設定エラー: {e}")
 
     while True:
         try:
@@ -172,6 +171,33 @@ def stdin_forwarder(pty):
                 continue
             pty.write(ch)
         except Exception:
+            break
+
+
+def window_size_monitor(pty, stop_event):
+    """ウインドウサイズの変更を定期的に監視するスレッド"""
+    try:
+        last_rows, last_cols = shutil.get_terminal_size((120, 30))
+    except Exception:
+        last_rows, last_cols = 120, 30
+
+    while not stop_event.is_set():
+        try:
+            time.sleep(0.2)  # 200ms ごとにチェック
+            try:
+                new_cols, new_rows = shutil.get_terminal_size((120, 30))
+            except Exception:
+                continue
+
+            if new_rows != last_rows or new_cols != last_cols:
+                try:
+                    log(f"[RESIZE] {last_rows}x{last_cols} -> {new_rows}x{new_cols}")
+                    pty.setwinsize(new_rows, new_cols)
+                    last_rows, last_cols = new_rows, new_cols
+                except Exception as e:
+                    log(f"[RESIZE] setwinsize エラー: {e}")
+        except Exception as e:
+            log(f"[MONITOR] エラー: {e}")
             break
 
 
@@ -211,12 +237,14 @@ def main():
         log(f"PtyProcess 起動失敗: {e}")
         sys.exit(1)
 
-    # ウインドウサイズ追跡用変数
-    last_rows, last_cols = rows, cols
-    resize_check_count = 0
+    stop_event = threading.Event()
 
     t = threading.Thread(target=stdin_forwarder, args=(pty,), daemon=True)
     t.start()
+
+    monitor_thread = threading.Thread(
+        target=window_size_monitor, args=(pty, stop_event), daemon=True)
+    monitor_thread.start()
 
     in_code_block = False
     line_buf = ""
@@ -239,19 +267,6 @@ def main():
                 if not pty.isalive():
                     log("PTY終了")
                     break
-
-                # ウインドウサイズ変更をチェック（10回に1回）
-                resize_check_count += 1
-                if resize_check_count >= 10:
-                    resize_check_count = 0
-                    try:
-                        new_cols, new_rows = shutil.get_terminal_size((120, 30))
-                        if new_rows != last_rows or new_cols != last_cols:
-                            log(f"[RESIZE] {last_rows}x{last_cols} -> {new_rows}x{new_cols}")
-                            pty.setwinsize(new_rows, new_cols)
-                            last_rows, last_cols = new_rows, new_cols
-                    except Exception as e:
-                        log(f"[RESIZE] エラー: {e}")
 
                 time.sleep(0.01)
                 continue
@@ -297,6 +312,7 @@ def main():
     except KeyboardInterrupt:
         log("KeyboardInterrupt")
     finally:
+        stop_event.set()
         try:
             pty.close(force=True)
         except Exception:
