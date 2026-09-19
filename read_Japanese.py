@@ -8,6 +8,8 @@ import subprocess
 import threading
 import datetime
 import time
+import signal
+import shutil
 
 try:
     import msvcrt
@@ -42,11 +44,11 @@ def log(msg):
 
 
 def _speak_sync(text):
-    """同期的に日本語テキストを読み上げる（ロック付き）"""
+    """バックグラウンドで日本語テキストを読み上げる"""
     global _tts_in_progress
 
-    with _tts_lock:
-        _tts_in_progress = True
+    def tts_worker():
+        global _tts_in_progress
         try:
             import tempfile
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
@@ -60,7 +62,7 @@ def _speak_sync(text):
                     f"Add-Type -AssemblyName System.Speech; "
                     f"$text = Get-Content -Path '{temp_file}' -Raw -Encoding UTF8; "
                     f"$speak = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-                    f"$speak.Rate = -2; "
+                    f"$speak.Rate = 2; "
                     f"$speak.Speak($text)"
                 )
                 proc = subprocess.Popen(
@@ -81,19 +83,27 @@ def _speak_sync(text):
         finally:
             _tts_in_progress = False
 
+    with _tts_lock:
+        if _tts_in_progress:
+            return
+        _tts_in_progress = True
+
+    # バックグラウンドスレッドで実行（メインスレッドをブロックしない）
+    t = threading.Thread(target=tts_worker, daemon=True)
+    t.start()
+
 
 def speak(text):
-    """テキストを読み上げ（同期処理、重複チェック付き）"""
-    # テキストのハッシュで重複チェック
+    """テキストを読み上げ（バックグラウンド処理、重複チェック付き）"""
     text_hash = hash(text)
-    if text_hash in _spoken_history:
-        log(f"[SKIP] 重複: {text[:50]}")
-        return
 
-    # 読み上げ済みとしてマーク
-    _spoken_history.add(text_hash)
+    with _tts_lock:
+        if text_hash in _spoken_history:
+            log(f"[SKIP] 重複: {text[:50]}")
+            return
+        _spoken_history.add(text_hash)
 
-    # TTSを実行
+    # ロック外で TTS 実行（ブロッキングなし）
     _speak_sync(text)
 
 
@@ -133,15 +143,17 @@ def stdin_forwarder(pty):
     if msvcrt is None:
         return
 
-    # Windows コンソールの入力モードを設定してマウスサポートを有効化
+    # Windows コンソールの入力モードを設定：矢印キー対応、マウス無効
     try:
         import ctypes
         kernel32 = ctypes.windll.kernel32
         handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
         mode = ctypes.c_ulong()
         kernel32.GetConsoleMode(handle, ctypes.byref(mode))
-        # ENABLE_MOUSE_INPUT を追加
-        mode.value |= 0x0010  # ENABLE_MOUSE_INPUT
+        # マウスイベント処理を無効化（スクロール問題の原因）
+        mode.value &= ~0x0010  # ENABLE_MOUSE_INPUT を削除
+        # 拡張キー入力を有効化
+        mode.value |= 0x0080  # ENABLE_EXTENDED_FLAGS
         kernel32.SetConsoleMode(handle, mode)
     except Exception:
         pass
@@ -182,17 +194,15 @@ def main():
     log(f"実行コマンド: {argv}")
 
     try:
-        import shutil
         cols, rows = shutil.get_terminal_size((120, 30))
     except Exception:
         cols, rows = 120, 30
 
     try:
-        log("PtyProcess.spawn() 実行中...")
+        log(f"PtyProcess.spawn() 実行中... (rows={rows}, cols={cols})")
         pty = PtyProcess.spawn(argv, dimensions=(rows, cols))
         log("PtyProcess 起動成功")
 
-        # PTY のバッファリング無効化
         try:
             pty.setwinsize(rows, cols)
         except Exception:
@@ -200,6 +210,10 @@ def main():
     except Exception as e:
         log(f"PtyProcess 起動失敗: {e}")
         sys.exit(1)
+
+    # ウインドウサイズ追跡用変数
+    last_rows, last_cols = rows, cols
+    resize_check_count = 0
 
     t = threading.Thread(target=stdin_forwarder, args=(pty,), daemon=True)
     t.start()
@@ -225,6 +239,20 @@ def main():
                 if not pty.isalive():
                     log("PTY終了")
                     break
+
+                # ウインドウサイズ変更をチェック（10回に1回）
+                resize_check_count += 1
+                if resize_check_count >= 10:
+                    resize_check_count = 0
+                    try:
+                        new_cols, new_rows = shutil.get_terminal_size((120, 30))
+                        if new_rows != last_rows or new_cols != last_cols:
+                            log(f"[RESIZE] {last_rows}x{last_cols} -> {new_rows}x{new_cols}")
+                            pty.setwinsize(new_rows, new_cols)
+                            last_rows, last_cols = new_rows, new_cols
+                    except Exception as e:
+                        log(f"[RESIZE] エラー: {e}")
+
                 time.sleep(0.01)
                 continue
 
