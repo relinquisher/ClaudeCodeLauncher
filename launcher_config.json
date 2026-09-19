@@ -13,5 +13,5 @@
   "skip_permissions": true,
   "continue_session": true,
   "resume_session": false,
-  "read_japanese": true
+  "read_japanese": false
 }
