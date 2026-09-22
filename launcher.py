@@ -25,7 +25,7 @@ def load_config():
             return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"recent_folders": [], "last_model": "sonnet", "read_japanese": False}
+    return {"recent_folders": [], "last_model": "sonnet", "read_japanese": False, "use_powershell": False}
 
 
 def save_config(cfg):
@@ -51,6 +51,8 @@ class LauncherApp(ctk.CTk):
             value=self.cfg.get("resume_session", False))
         self.read_japanese_var = ctk.BooleanVar(
             value=self.cfg.get("read_japanese", False))
+        self.use_powershell_var = ctk.BooleanVar(
+            value=self.cfg.get("use_powershell", False))
         # --continue と --resume は同時指定できないので排他にする
         if self.continue_var.get() and self.resume_var.get():
             self.resume_var.set(False)
@@ -161,10 +163,18 @@ class LauncherApp(ctk.CTk):
             command=lambda: self._toggle_session_opt("resume"),
         ).pack(side="left")
 
+        opts2 = ctk.CTkFrame(self, fg_color="transparent")
+        opts2.pack(pady=(10, 0))
+
         ctk.CTkCheckBox(
-            self, variable=self.read_japanese_var,
+            opts2, variable=self.read_japanese_var,
             text="日本語を読み上げる",
-            font=("Yu Gothic UI", 13)).pack(pady=(10, 0))
+            font=("Yu Gothic UI", 13)).pack(side="left", padx=(0, 16))
+
+        ctk.CTkCheckBox(
+            opts2, variable=self.use_powershell_var,
+            text="PowerShell 7 を使う",
+            font=("Yu Gothic UI", 13)).pack(side="left")
 
         self.launch_btn = ctk.CTkButton(
             self, text="起動 ▶", height=52, corner_radius=26,
@@ -203,10 +213,12 @@ class LauncherApp(ctk.CTk):
         do_continue = self.continue_var.get()
         do_resume = self.resume_var.get()
         read_japanese = self.read_japanese_var.get()
+        use_powershell = self.use_powershell_var.get()
         self.cfg["skip_permissions"] = skip_perm
         self.cfg["continue_session"] = do_continue
         self.cfg["resume_session"] = do_resume
         self.cfg["read_japanese"] = read_japanese
+        self.cfg["use_powershell"] = use_powershell
         save_config(self.cfg)
         self.folder_combo.configure(values=self.cfg["recent_folders"])
 
@@ -229,7 +241,13 @@ class LauncherApp(ctk.CTk):
                 cmd = ["python", str(script_path)] + claude_cmd
             else:
                 # 通常起動
-                cmd = ["cmd", "/k"] + claude_cmd
+                if use_powershell:
+                    # PowerShell 7 で起動
+                    claude_cmd_str = " ".join(claude_cmd)
+                    cmd = ["pwsh", "-NoExit", "-Command", claude_cmd_str]
+                else:
+                    # cmd.exe で起動
+                    cmd = ["cmd", "/k"] + claude_cmd
 
         try:
             subprocess.Popen(
@@ -244,8 +262,9 @@ class LauncherApp(ctk.CTk):
                 opt = " (--resume)"
             if read_japanese:
                 opt += " 🔊"
+            shell_info = " (PowerShell 7)" if use_powershell else ""
             self.status.configure(
-                text=f"✓ {MODELS[model]['label']} を {folder} で起動しました{opt}",
+                text=f"✓ {MODELS[model]['label']} を {folder} で起動しました{opt}{shell_info}",
                 text_color="#60C080")
         except Exception as e:
             self.status.configure(text=f"⚠ 起動失敗: {e}", text_color="#E06060")
