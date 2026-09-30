@@ -238,13 +238,32 @@ class LauncherApp(ctk.CTk):
             if read_japanese:
                 # 日本語読み上げを有効にする場合、PTY 経由のラッパーで起動
                 script_path = Path(__file__).parent / "read_Japanese.py"
-                cmd = ["python", str(script_path)] + claude_cmd
+                if use_powershell:
+                    # PowerShell で read_Japanese.py を実行
+                    import shutil
+                    pwsh_exe = shutil.which("pwsh")
+                    if pwsh_exe:
+                        # コマンドを PowerShell で実行
+                        claude_cmd_str = " ".join(claude_cmd)
+                        ps_cmd = f"python '{script_path}' {claude_cmd_str}"
+                        cmd = ["pwsh", "-NoExit", "-Command", ps_cmd]
+                    else:
+                        # pwsh が見つからない場合は python で実行
+                        cmd = ["python", str(script_path)] + claude_cmd
+                else:
+                    cmd = ["python", str(script_path)] + claude_cmd
             else:
                 # 通常起動
                 if use_powershell:
                     # PowerShell 7 で起動
-                    claude_cmd_str = " ".join(claude_cmd)
-                    cmd = ["pwsh", "-NoExit", "-Command", claude_cmd_str]
+                    import shutil
+                    pwsh_exe = shutil.which("pwsh")
+                    if pwsh_exe:
+                        claude_cmd_str = " ".join(claude_cmd)
+                        cmd = ["pwsh", "-NoExit", "-Command", claude_cmd_str]
+                    else:
+                        # pwsh が見つからない場合は cmd.exe にフォールバック
+                        cmd = ["cmd", "/k"] + claude_cmd
                 else:
                     # cmd.exe で起動
                     cmd = ["cmd", "/k"] + claude_cmd

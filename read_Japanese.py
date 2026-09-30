@@ -120,18 +120,29 @@ def maybe_speak(clean_text, in_code_block):
     # 「●」を除去してクリーンアップ
     filtered = text[1:].strip()
 
-    # バックスラッシュなどの制御文字を明示的に除外
-    if '\\' in filtered or '\x1b' in filtered:
-        log(f"[SKIP] 制御文字含む: {filtered[:50]}")
+    # ANSI エスケープシーケンスが残っていたら除外
+    if '\x1b' in filtered:
+        log(f"[SKIP] ANSIコード含む: {filtered[:50]}")
         return
 
-    # 制御文字（ord < 32）を除外
-    if any(ord(c) < 32 for c in filtered):
+    # 制御文字（ord < 32、改行・タブ除く）を除外
+    if any(ord(c) < 32 and c not in '\t\n\r' for c in filtered):
         log(f"[SKIP] 制御コード含む: {filtered[:50]}")
         return
 
     # 日本語を含まない行はスキップ
     if not JA_RE.search(filtered):
+        return
+
+    # ツール呼び出し行（例: Write(E:\path\対策.md), Bash(...), xxx (MCP)(...)）はスキップ
+    if re.match(r'^[A-Za-z][\w.:\- ]*(\(MCP\))?\(', filtered):
+        log(f"[SKIP] ツール呼び出し: {filtered[:50]}")
+        return
+
+    # 最初の単語がコマンド名（英数字のみ）の場合はスキップ
+    first_word = filtered.split()[0] if filtered.split() else ""
+    if first_word and re.match(r'^[a-zA-Z0-9._\-]+$', first_word):
+        log(f"[SKIP] コマンド名のみ: {first_word}")
         return
 
     log(f"[読み上げ] {filtered[:80]}")
